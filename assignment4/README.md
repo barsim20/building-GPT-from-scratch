@@ -92,8 +92,28 @@ We did not run the GPU column (no GPU available on the machine we used).
 
 - Seed: `1337` (`torch.manual_seed`, also seeds `random` and `numpy`).
 - Machine: Linux container, CPU only, standard CPython, PyTorch CPU build.
-- Total notebook run time: _see the printed run time in the last cell of
-  the notebook, copied here after the final run_.
+- Total notebook run time: about **21 minutes**, top to bottom (the
+  required 2000-step run alone is under 4 minutes, well inside the
+  10-minute budget; the rest is the k-sweep, the hyperparameter grid, and
+  the neural n-gram baseline).
+
+### Final numbers (Experiment 3)
+
+| Model | Shakespeare PP/char | WSJ PP/char | Params | Train time |
+|---|---|---|---|---|
+| Count n-gram (A2) | 9.63 | 13.55 | 178,726 counted (context, token) pairs | 0.6 s |
+| Neural n-gram (A3) | 5.91 | 9.39 | 375,531 | 67 s |
+| GPT (A4) | 4.84 | 9.00 | 876,331 | 231 s |
+
+All three checks in the notebook pass: pre-training loss sits at 7.12 vs.
+`ln(V_total) = 6.97`, the causal-mask sanity check shows a 0.0 difference
+at position 0 and a nonzero difference at the last position when the last
+token is perturbed, and the GPT's validation loss (3.90, `<bos>` excluded)
+beats the neural n-gram's training loss (4.42, same convention) on the
+same k. Generation now actually stops at `<eos>` on its own most of the
+time (100 % for the neural n-gram and the GPT in our 20-try check, 10 %
+for the count n-gram, which loses the thread too quickly to ever reach a
+sentence end).
 
 ### Statement about AI use
 
