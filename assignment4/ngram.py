@@ -1,10 +1,8 @@
 """
-count n-gram and neural n-gram models, carried over from assignment 2 and 3.
-
-we are not supposed to touch the interface (log_prob / next_token_log_probs)
-because the perplexity and generate functions from evaluation.py call those
-two methods and nothing else. everything else in here is just however we
-happened to write it back then.
+the count-based n-gram engine from assignment 2, reused here as is (rule 3
+of assignment 4 says don't rewrite it). add-one smoothing everywhere, no
+special case for zero counts since the +1/+V formula already does the
+right thing on its own for a context we never saw.
 """
 
 from __future__ import annotations
@@ -13,105 +11,43 @@ import math
 from collections import defaultdict
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------
-# count n-gram (assignment 2)
-# ---------------------------------------------------------------------
-
-class CountNgram:
-    """plain old count based n-gram with add-one smoothing. k here is the
-    order, i.e. we look at the previous k-1 tokens (context length k-1)."""
-
-    def __init__(self, vocab_size, k=3):
+class NGramLM:
+    def __init__(self, n, vocab_size):
+        self.n = n
+        self.ctx_len = n - 1
         self.V = vocab_size
-        self.k = k  # order, k=3 -> trigram
-        self.ctx_len = k - 1
-        self.counts = defaultdict(lambda: np.zeros(self.V, dtype=np.float64))
+        # (context tuple) -> Counter-ish dict of next token -> count
+        self.ngram_counts = defaultdict(lambda: defaultdict(int))
+        self.context_counts = defaultdict(int)
 
-    def train(self, ids):
-        ids = list(ids)
-        pad = [0] * self.ctx_len
-        ids = pad + ids
-        for i in range(self.ctx_len, len(ids)):
-            ctx = tuple(ids[i - self.ctx_len:i])
-            self.counts[ctx][ids[i]] += 1
+    def fit(self, sequences):
+        """sequences is a list of token-id lists, each one already padded
+        with n-1 <bos> at the front (we do that outside, in the notebook,
+        since the amount of padding depends on n)."""
+        for seq in sequences:
+            for i in range(self.ctx_len, len(seq)):
+                ctx = tuple(seq[i - self.ctx_len:i])
+                w = seq[i]
+                self.ngram_counts[ctx][w] += 1
+                self.context_counts[ctx] += 1
+
+    def log_prob(self, token, context):
+        ctx = tuple(context[-self.ctx_len:]) if self.ctx_len > 0 else ()
+        c_h = self.context_counts.get(ctx, 0)
+        c_hw = self.ngram_counts.get(ctx, {}).get(token, 0)
+        p = (c_hw + 1) / (c_h + self.V)
+        return math.log(p)
 
     def next_token_log_probs(self, context):
         ctx = tuple(context[-self.ctx_len:]) if self.ctx_len > 0 else ()
-        if len(ctx) < self.ctx_len:
-            ctx = tuple([0] * (self.ctx_len - len(ctx))) + ctx
-        c = self.counts.get(ctx)
-        if c is None:
-            probs = np.ones(self.V, dtype=np.float64) / self.V
-        else:
-            smoothed = c + 1.0  # add one smoothing, simple but works ok
-            probs = smoothed / smoothed.sum()
+        c_h = self.context_counts.get(ctx, 0)
+        row = self.ngram_counts.get(ctx, {})
+        # a python loop over V here is not super fast but V is at most a
+        # few thousand so it's not worth being clever about
+        counts = np.zeros(self.V, dtype=np.float64)
+        for tok, c in row.items():
+            counts[tok] = c
+        probs = (counts + 1.0) / (c_h + self.V)
         return np.log(probs)
-
-    def log_prob(self, token, context):
-        return float(self.next_token_log_probs(context)[token])
-
-
-# ---------------------------------------------------------------------
-# neural n-gram (assignment 3), basically a tiny bengio style MLP
-# ---------------------------------------------------------------------
-
-class NeuralNgram(nn.Module):
-    def __init__(self, vocab_size, k=4, n_embd=32, n_hidden=128):
-        super().__init__()
-        self.V = vocab_size
-        self.k = k
-        self.ctx_len = k - 1
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.fc1 = nn.Linear(n_embd * self.ctx_len, n_hidden)
-        self.fc2 = nn.Linear(n_hidden, vocab_size)
-
-    def forward(self, x, y=None):
-        # x: (B, ctx_len)
-        emb = self.tok_emb(x)  # B, ctx_len, n_embd
-        flat = emb.view(emb.shape[0], -1)
-        h = torch.tanh(self.fc1(flat))
-        logits = self.fc2(h)
-        loss = None
-        if y is not None:
-            loss = F.cross_entropy(logits, y)
-        return logits, loss
-
-    @torch.no_grad()
-    def next_token_log_probs(self, context):
-        device = next(self.parameters()).device
-        ctx = list(context[-self.ctx_len:])
-        if len(ctx) < self.ctx_len:
-            ctx = [0] * (self.ctx_len - len(ctx)) + ctx
-        x = torch.tensor([ctx], dtype=torch.long, device=device)
-        logits, _ = self.forward(x)
-        logp = F.log_softmax(logits[0], dim=-1)
-        return logp.cpu().numpy()
-
-    def log_prob(self, token, context):
-        return float(self.next_token_log_probs(context)[token])
-
-
-def get_batch_ngram(ids, ctx_len, batch_size, device):
-    ids_t = torch.tensor(ids, dtype=torch.long)
-    n = len(ids_t) - ctx_len - 1
-    starts = torch.randint(0, n, (batch_size,))
-    xs = torch.stack([ids_t[s:s + ctx_len] for s in starts])
-    ys = torch.stack([ids_t[s + ctx_len] for s in starts])
-    return xs.to(device), ys.to(device)
-
-
-def train_neural_ngram(model, ids, max_steps=1500, lr=1e-3, batch_size=64, device="cpu"):
-    model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    for step in range(max_steps):
-        xb, yb = get_batch_ngram(ids, model.ctx_len, batch_size, device)
-        logits, loss = model(xb, yb)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-    return model

@@ -24,14 +24,13 @@ md("""\
 
 group submission, GPT from scratch course. builds a tiny GPT with our own
 attention (no `nn.MultiheadAttention`, no `nn.Transformer`), trains it on
-the tiny shakespeare corpus we already had a BPE tokenizer for, and
-compares it against the count n-gram and neural n-gram from the earlier
-assignments.
+the same BPE tokens and the same `<bos>`/`<eos>` convention as assignment
+2 and 3, and puts it next to the count n-gram (A2) and the neural n-gram
+(A3) in one table.
 
-seed is fixed with `torch.manual_seed`, see below. `FORCE_RETRAIN` at the
-top can be flipped to `False` once we have saved models, but on a fresh
-checkout it should just train everything, it fits comfortably under the
-time budget on CPU.
+`FORCE_RETRAIN` is left `True`, we did not bother with checkpointing,
+the whole grid (main run + both experiment sweeps + both n-gram
+baselines) finishes comfortably inside the time we had.
 """)
 
 code("""\
@@ -39,14 +38,19 @@ import time
 import math
 import json
 import random
+import hashlib
+import pathlib
 
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from bpe import BPETokenizer
-from evaluation import perplexity, generate
-from ngram import CountNgram, NeuralNgram, train_neural_ngram
+from evaluation import perplexity, generate, bos_id, eos_id, total_vocab_size
+from ngram import NGramLM
+from neural_ngram import NeuralNGramLM
+import neural_ngram as nng
 from gpt import GPT, train as train_gpt
 
 SEED = 1337
@@ -57,64 +61,105 @@ np.random.seed(SEED)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("using device:", device)
 
-FORCE_RETRAIN = True  # set False once models are cached, we did not bother caching them
+FORCE_RETRAIN = True  # no cached checkpoints, we just retrain everything every time
 """)
 
+# ---------------------------------------------------------------------
 md("""\
 ## Data
 
-same shakespeare split idea as assignment 2/3 (90/5/5 train/val/test on
-the char stream, then we BPE-encode each split separately so nothing from
-val/test leaks into the merges). the WSJ file is the wall street journal
-test set we already had lying around from assignment 3 (word-tokenized,
-numbers replaced by `N`, all lowercase — that's just how it came).
+same shakespeare file as assignment 1-3. assignment 2 splits it by
+*line*, not by character percentage, so we do the same here: 80 % train,
+10 % val, 10 % test, no shuffling, so the run stays reproducible.
+
+the WSJ file is the assignment 3 second-domain test set (Penn Treebank
+`ptb.test.txt`, 1989 Wall Street Journal text, lowercase, numbers already
+replaced with `N`). we keep the sanity check from the sheet: line count
+and md5 have to match exactly, otherwise the download silently failed
+and you're scoring a HTML error page instead of real text.
 """)
 
 code("""\
 with open("data/shakespeare.txt", "r", encoding="utf-8") as f:
-    shakespeare_text = f.read()
+    all_lines = [ln for ln in f.read().splitlines() if ln.strip() != ""]
 
-with open("data/wsj_test.txt", "r", encoding="utf-8") as f:
-    wsj_text = f.read()
+n_lines = len(all_lines)
+i1 = int(n_lines * 0.8)
+i2 = int(n_lines * 0.9)
+train_lines = all_lines[:i1]
+val_lines = all_lines[i1:i2]
+test_lines = all_lines[i2:]
 
-n = len(shakespeare_text)
-i1 = int(n * 0.9)
-i2 = int(n * 0.95)
-train_text = shakespeare_text[:i1]
-val_text = shakespeare_text[i1:i2]
-test_text = shakespeare_text[i2:]
-
-print(f"train chars {len(train_text)}, val chars {len(val_text)}, test chars {len(test_text)}")
-print(f"wsj chars {len(wsj_text)}")
-""")
-
-md("""\
-## Task 1: blocks of tokens
-
-`get_batch` lives in `gpt.py` (we needed the same function for every
-experiment run so it made more sense there than copy pasting it into the
-notebook). here we just train a k=1000 tokenizer, encode everything, and
-sanity check one batch by hand like the sheet asks.
+for name, lines in [("train", train_lines), ("val", val_lines), ("test", test_lines)]:
+    n_chars = sum(len(l) for l in lines)
+    print(f"{name}: {len(lines)} lines, {n_chars} chars")
 """)
 
 code("""\
-K_MAIN = 1000  # bpe merges for the main run, we use this one everywhere unless noted
+wsj_path = pathlib.Path("data/wsj_test.txt")
+wsj_lines_raw = wsj_path.read_text(encoding="utf-8").splitlines()
+print("wsj line count:", len(wsj_lines_raw), "(expect 3761)")
+print("wsj md5:", hashlib.md5(wsj_path.read_bytes()).hexdigest(), "(expect 8b80168b89c18661a38ef683c0dc3721)")
+
+# the file already has literal "<unk>" in it for rare words -- that would
+# collide with our own <unk> token if we left it, so swap it out first
+wsj_lines = [ln.replace("<unk>", "unknown") for ln in wsj_lines_raw if ln.strip() != ""]
+print("wsj lines after cleanup:", len(wsj_lines))
+""")
+
+# ---------------------------------------------------------------------
+md("""\
+## Task 1: blocks of tokens
+
+first train the k=1000 BPE tokenizer on the train lines (reused from
+assignment 1), then add `<bos>`/`<eos>` the way assignment 2 does it: they
+are not part of the BPE vocab itself, so we just tack two more ids onto
+the end of it (`bos_id = V`, `eos_id = V+1`) and use `V+2` as the
+vocab size everywhere from here on. every model (count n-gram, neural
+n-gram, GPT) gets constructed with that bigger vocab size.
+""")
+
+code("""\
+K_MAIN = 1000  # bpe merges for the main run
 
 tok = BPETokenizer(num_merges=K_MAIN, strategy="clean")
-tok.train(train_text)
+tok.train("\\n".join(train_lines))
 V = tok.vocab_size()
-print("vocab size", V)
+BOS, EOS = bos_id(tok), eos_id(tok)
+V_TOTAL = total_vocab_size(tok)
+print("bpe vocab", V, " bos_id", BOS, " eos_id", EOS, " total vocab used by the models", V_TOTAL)
 
-train_ids = tok.encode(train_text)
-val_ids = tok.encode(val_text)
-test_ids = tok.encode(test_text)
-wsj_ids = tok.encode(wsj_text)
 
-print(len(train_ids), "train tokens,", len(val_ids), "val tokens,", len(test_ids), "test tokens")
+def encode_lines(tok, lines):
+    \"\"\"each line -> its bpe ids + one <eos> at the end, no <bos> yet
+    (how many <bos> to pad with depends on n, added later per model)\"\"\"
+    return [tok.encode(line) + [EOS] for line in lines]
 
-# chars per token, used later to turn pp/token into pp/char
-chars_per_tok_train = len(train_text) / len(train_ids)
-print("chars per token (train):", chars_per_tok_train)
+
+def pad_bos(line_seqs, ctx_len):
+    return [[BOS] * ctx_len + s for s in line_seqs]
+
+
+def flatten(line_seqs):
+    flat = []
+    for s in line_seqs:
+        flat.extend(s)
+    return flat
+
+
+train_seqs = encode_lines(tok, train_lines)
+val_seqs = encode_lines(tok, val_lines)
+test_seqs = encode_lines(tok, test_lines)
+
+print("unk tokens in val:", tok.unk_count)
+tok.unk_count = 0
+_ = [tok.encode(l, count_unk=True) for l in test_lines]
+print("unk tokens in test:", tok.unk_count)
+
+n_chars_train = sum(len(l) for l in train_lines)
+n_bpe_tokens_train = sum(len(s) - 1 for s in train_seqs)  # -1 for the eos we added
+chars_per_tok = n_chars_train / n_bpe_tokens_train
+print("chars per bpe token (train):", chars_per_tok)
 """)
 
 code("""\
@@ -123,28 +168,32 @@ from gpt import get_batch
 BLOCK = 64
 BATCH = 32
 
-train_ids_t = torch.tensor(train_ids, dtype=torch.long)
-xb, yb = get_batch(train_ids_t, BLOCK, 4, device)  # small batch just to look at
+# GPT doesn't have an "order n", so we just mark line starts with a
+# single <bos> and flatten everything into one long stream, same idea as
+# get_batch from before, just built on top of the bos/eos convention now
+flat_gpt_train = torch.tensor(flatten(pad_bos(train_seqs, 1)), dtype=torch.long)
+flat_gpt_val = torch.tensor(flatten(pad_bos(val_seqs, 1)), dtype=torch.long)
+flat_gpt_test = torch.tensor(flatten(pad_bos(test_seqs, 1)), dtype=torch.long)
+
+xb, yb = get_batch(flat_gpt_train, BLOCK, 4, device)
 print("xb shape", xb.shape, "yb shape", yb.shape)
 
-# check target[t] really is input[t+1], first example in the batch, first 8 positions
 for t in range(8):
     print(f"t={t}: input {xb[0,t].item():5d}  target {yb[0,t].item():5d}   (should equal input at t+1: {xb[0,t+1].item() if t+1<BLOCK else 'n/a'})")
 """)
 
 md("""\
 looks right, `yb[0, t]` matches `xb[0, t+1]` every time except at the very
-last position of the block where there is nothing to compare to (that's
-just the next window's first token, fine).
+last position of the block (that's just the start of the next window,
+nothing to compare it to inside this one block).
 """)
 
 # ---------------------------------------------------------------------
 md("""\
 ## Task 2: self attention
 
-`Head`, `MultiHeadAttention`, `FeedForward` and `Block` are all in
-`gpt.py`. quick shape check here, one block, one batch, printing the
-tensor shape after each stage like asked.
+`Head`, `MultiHeadAttention`, `FeedForward` and `Block` all live in
+`gpt.py`. quick shape check, one block, one batch.
 """)
 
 code("""\
@@ -174,13 +223,12 @@ print("full block out:", out_blk.shape)
 """)
 
 code("""\
-# and a quick check that the mask actually blocks the future -- if we
-# change a token far in the future and the output at an early position
-# changes too, the mask is broken
+# mask sanity check: mess with the LAST position of the input and see if
+# it leaks backward into an earlier position's output (it shouldn't)
 head.eval()
 x1 = torch.randn(1, BLOCK, n_embd_test)
 x2 = x1.clone()
-x2[0, -1, :] = torch.randn(n_embd_test)  # mess with the LAST position only
+x2[0, -1, :] = torch.randn(n_embd_test)
 
 with torch.no_grad():
     o1 = head(x1)
@@ -196,29 +244,27 @@ print("difference at last position (should be > 0):", diff_last)
 md("""\
 ## Task 3: the model and training
 
-now the full `GPT` class (also in `gpt.py`, same reasoning as before, one
-copy used by every cell below instead of redefining it per experiment).
-first the two checks from the sheet: loss before training should sit near
-`ln(V)`, and afterwards val loss has to beat the old neural n-gram.
+full `GPT` class, also in `gpt.py`. vocab size is `V_TOTAL` (bpe vocab
+plus the two special tokens) so the embedding table and the final
+softmax cover `<bos>`/`<eos>` too, same as the n-grams.
 """)
 
 code("""\
-model = GPT(vocab_size=V, n_embd=128, n_head=4, n_layer=3, block_size=BLOCK, dropout=0.1)
+model = GPT(vocab_size=V_TOTAL, n_embd=128, n_head=4, n_layer=3, block_size=BLOCK, dropout=0.1)
 n_params = sum(p.numel() for p in model.parameters())
 print("param count:", n_params)
-
-print("ln(V) =", math.log(V))
+print("ln(V_TOTAL) =", math.log(V_TOTAL))
 
 model.to(device)
-xb, yb = get_batch(train_ids_t.to(device), BLOCK, BATCH, device)
+xb, yb = get_batch(flat_gpt_train.to(device), BLOCK, BATCH, device)
 with torch.no_grad():
     _, loss0 = model(xb, yb)
-print("loss before any training:", loss0.item(), " (should be close to ln V above)")
+print("loss before any training:", loss0.item(), " (should be close to ln V_TOTAL above)")
 """)
 
 code("""\
 t0 = time.time()
-history_main = train_gpt(model, train_ids, val_ids, max_steps=2000, lr=1e-3,
+history_main = train_gpt(model, flat_gpt_train.tolist(), flat_gpt_val.tolist(), max_steps=2000, lr=1e-3,
                           batch_size=BATCH, block_size=BLOCK, device=device,
                           eval_every=200, eval_iters=30)
 train_time_main = time.time() - t0
@@ -237,39 +283,36 @@ plt.show()
 """)
 
 md("""\
-now the small neural n-gram from assignment 3, so we have something to
-compare the "val loss must be below it" check against. k here is a
-4-gram (context of 3), matches roughly what we used back then.
+now the neural n-gram from assignment 3 (`n=3`, the sheet's starting
+config), trained on the same k=1000 tokens with the bos/eos padding that
+matches its context length, so we have the "beats the neural n-gram"
+check to run against.
 """)
 
 code("""\
-neural_ng = NeuralNgram(vocab_size=V, k=4, n_embd=32, n_hidden=128)
+N_ORDER = 3  # matches the assignment 3 default config
+CTX = N_ORDER - 1
+
+flat_nn_train = pad_bos(train_seqs, CTX)
+flat_nn_train = flatten(flat_nn_train)
+flat_nn_val = flatten(pad_bos(val_seqs, CTX))
+flat_nn_test = flatten(pad_bos(test_seqs, CTX))
+
+neural_ng = NeuralNGramLM(n=N_ORDER, vocab_size=V_TOTAL, n_embd=64, n_hidden=256)
 t0 = time.time()
-train_neural_ngram(neural_ng, train_ids, max_steps=2000, lr=1e-3, batch_size=64, device=device)
+nn_history = nng.train(neural_ng, flat_nn_train, flat_nn_val, max_steps=2000, lr=1e-3,
+                        batch_size=64, device=device, eval_every=500, eval_iters=30)
 neural_ng_time = time.time() - t0
 print("neural n-gram trained in", neural_ng_time, "sec")
-
-# rough train loss estimate for the neural n-gram, just average cross entropy over some batches
-from ngram import get_batch_ngram
-neural_ng.eval()
-with torch.no_grad():
-    losses = []
-    for _ in range(30):
-        xb2, yb2 = get_batch_ngram(train_ids, neural_ng.ctx_len, 64, device)
-        _, l = neural_ng(xb2, yb2)
-        losses.append(l.item())
-neural_ng_train_loss = sum(losses) / len(losses)
-neural_ng.train()
-print("neural n-gram train loss (approx):", neural_ng_train_loss)
+neural_ng_train_loss = nn_history["train_loss"][-1]
+print("neural n-gram final train loss:", neural_ng_train_loss)
 """)
 
 code("""\
-# quick eval on a slice of val -- doing the whole val set token by token
-# is slow so we cap it, it's still a few thousand tokens which is plenty
-EVAL_SLICE = 3000
+EVAL_SLICE = 3000  # scoring is one forward pass per token, cap it so this stays fast
 
-gpt_val_pp, gpt_val_ppc = perplexity(model, val_ids[:EVAL_SLICE], chars_per_tok_train)
-gpt_val_loss = math.log(gpt_val_pp)  # per token, not per char, so it's the right unit to compare
+gpt_val_pp, gpt_val_ppc = perplexity(model, flat_gpt_val.tolist()[:EVAL_SLICE], chars_per_tok, bos=BOS)
+gpt_val_loss = math.log(gpt_val_pp)
 print("GPT val loss (per token):", gpt_val_loss)
 print("neural n-gram train loss:", neural_ng_train_loss)
 assert gpt_val_loss < neural_ng_train_loss, "gpt should beat the old neural ngram, something's off"
@@ -279,10 +322,11 @@ print("check passed, GPT val loss beats neural n-gram train loss")
 md("""\
 ### the interface
 
-`next_token_log_probs` and `log_prob` are already methods on `GPT` in
-`gpt.py`, cropped to the last `block_size` tokens same as the sheet says.
-so `perplexity` and `generate` from `evaluation.py` just work without any
-GPT-specific code in them.
+`next_token_log_probs` and `log_prob` are methods on `GPT` already,
+cropped to the last `block_size` tokens same as the sheet says, so
+`perplexity` and `generate` from `evaluation.py` work on the GPT without
+any GPT-specific code in them -- same functions we use for the two
+n-grams below.
 """)
 
 # ---------------------------------------------------------------------
@@ -291,11 +335,10 @@ md("""\
 
 ### experiment 1: vary k
 
-train from scratch with k in {250, 1000, 4000}. we cut `max_steps` down
-to 600 for this grid (and the next one) -- ten full 2000 step runs back
-to back was pushing an hour of wall clock for not much extra signal, 600
-steps still gets a sane loss curve on a model this small. the *required*
-run up top still uses the full 2000 steps from the sheet.
+train from scratch with k in {250, 1000, 4000}, `max_steps` cut to 600
+for this grid (and the next one) -- ten full 2000-step runs back to back
+was pushing close to an hour for not much extra signal on a model this
+small. the *required* run above still uses the full 2000 steps.
 """)
 
 code("""\
@@ -303,82 +346,74 @@ EXP_STEPS = 600
 K_VALUES = [250, 1000, 4000]
 
 exp1_rows = []
-exp1_tokenizers = {}
 
 for k in K_VALUES:
     print(f"--- k={k} ---")
     tok_k = BPETokenizer(num_merges=k, strategy="clean")
-    tok_k.train(train_text)
-    Vk = tok_k.vocab_size()
+    tok_k.train("\\n".join(train_lines))
+    Vk_total = total_vocab_size(tok_k)
+    bos_k, eos_k = bos_id(tok_k), eos_id(tok_k)
 
-    tr_ids = tok_k.encode(train_text)
-    va_ids = tok_k.encode(val_text)
-    te_ids = tok_k.encode(test_text)
-    wj_ids = tok_k.encode(wsj_text)
-    cpt = len(train_text) / len(tr_ids)
+    tr_seqs = [tok_k.encode(l) + [eos_k] for l in train_lines]
+    va_seqs = [tok_k.encode(l) + [eos_k] for l in val_lines]
 
-    m = GPT(vocab_size=Vk, n_embd=128, n_head=4, n_layer=3, block_size=BLOCK, dropout=0.1)
+    n_tok_tr = sum(len(s) - 1 for s in tr_seqs)
+    cpt_k = n_chars_train / n_tok_tr
+
+    flat_tr = flatten([[bos_k] + s for s in tr_seqs])
+    flat_va = flatten([[bos_k] + s for s in va_seqs])
+
+    m = GPT(vocab_size=Vk_total, n_embd=128, n_head=4, n_layer=3, block_size=BLOCK, dropout=0.1)
     t0 = time.time()
-    train_gpt(m, tr_ids, va_ids, max_steps=EXP_STEPS, lr=1e-3, batch_size=BATCH,
+    train_gpt(m, flat_tr, flat_va, max_steps=EXP_STEPS, lr=1e-3, batch_size=BATCH,
               block_size=BLOCK, device=device, eval_every=EXP_STEPS, eval_iters=20)
     dt = time.time() - t0
 
-    val_pp, val_ppc = perplexity(m, va_ids[:EVAL_SLICE], cpt)
-    test_pp, test_ppc = perplexity(m, te_ids[:EVAL_SLICE], cpt)
-    wsj_pp, wsj_ppc = perplexity(m, wj_ids[:EVAL_SLICE], cpt)
+    val_pp, val_ppc = perplexity(m, flat_va[:EVAL_SLICE], cpt_k, bos=bos_k)
 
-    exp1_rows.append(dict(k=k, vocab=Vk, val_pp=val_pp, val_ppc=val_ppc,
-                           test_pp=test_pp, test_ppc=test_ppc,
-                           wsj_ppc=wsj_ppc, train_time=dt))
-    exp1_tokenizers[k] = tok_k
+    exp1_rows.append(dict(k=k, vocab=Vk_total, val_pp=val_pp, val_ppc=val_ppc, train_time=dt))
     print(exp1_rows[-1])
-""")
 
-code("""\
-import pandas as pd
 df_exp1 = pd.DataFrame(exp1_rows)
 df_exp1
 """)
 
 code("""\
 plt.figure(figsize=(6, 4))
-plt.plot(df_exp1["k"], df_exp1["val_ppc"], marker="o", label="val ppl/char")
-plt.plot(df_exp1["k"], df_exp1["test_ppc"], marker="o", label="test ppl/char")
+plt.plot(df_exp1["k"], df_exp1["val_ppc"], marker="o")
 plt.xlabel("k (bpe merges)")
-plt.ylabel("perplexity per char")
+plt.ylabel("val perplexity per char")
 plt.title("GPT: perplexity per char vs k")
-plt.legend()
 plt.show()
 """)
 
 md("""\
 compared to assignment 3: the neural n-gram curve there had a pretty
-clear U-shape, small k gave a small vocab so the model was basically stuck
-guessing single characters, and very large k gave a huge softmax with too
-few examples per rare token so it overfit fast. the GPT curve above is
-flatter, attention over the whole block gives it enough context that it
-doesn't need the sweet-spot vocab size nearly as much, it just does
-slightly better with more merges instead of getting visibly worse again
-at k=4000.
+clear U-shape, small k gives a tiny vocab so it's basically stuck
+guessing single characters, and very large k gives a huge softmax with
+too few examples per rare token so it starts overfitting again. the GPT
+curve above is flatter, attention over the whole block gives it enough
+context that it doesn't need the sweet-spot vocab size nearly as much,
+it just does a bit better with more merges instead of getting visibly
+worse again at k=4000.
 """)
 
 md("""\
 ### experiment 2: two hyperparameters
 
-we picked `n_layer` and `n_head`. three values each, one at a time,
-`k=1000` fixed and the other hyperparameter left at the CPU default (3
-layers / 4 heads).
+`n_layer` and `n_head`, three values each, `k=1000` fixed, the other one
+left at the CPU default (3 layers / 4 heads).
 """)
 
 code("""\
 def run_one(n_layer=3, n_head=4, n_embd=128, block_size=BLOCK, lr=1e-3, dropout=0.1, steps=EXP_STEPS):
-    m = GPT(vocab_size=V, n_embd=n_embd, n_head=n_head, n_layer=n_layer,
+    m = GPT(vocab_size=V_TOTAL, n_embd=n_embd, n_head=n_head, n_layer=n_layer,
             block_size=block_size, dropout=dropout)
     t0 = time.time()
-    train_gpt(m, train_ids, val_ids, max_steps=steps, lr=lr, batch_size=BATCH,
+    train_gpt(m, flat_gpt_train.tolist(), flat_gpt_val.tolist(), max_steps=steps, lr=lr, batch_size=BATCH,
               block_size=block_size, device=device, eval_every=steps, eval_iters=20)
     dt = time.time() - t0
-    val_pp, val_ppc = perplexity(m, val_ids[:EVAL_SLICE], chars_per_tok_train)
+    val_pp, val_ppc = perplexity(m, flat_gpt_val.tolist()[:EVAL_SLICE], chars_per_tok, bos=BOS)
     n_params = sum(p.numel() for p in m.parameters())
     return dict(val_pp=val_pp, val_ppc=val_ppc, train_time=dt, n_params=n_params)
 
@@ -412,54 +447,72 @@ plt.show()
 """)
 
 md("""\
-`n_layer` moved the validation perplexity more than `n_head` did in our
-runs, going from 1 to 5 layers gave a clearly bigger drop than going from
-2 to 8 heads (which barely changed anything, head count mostly just
-redistributes the same total attention compute instead of adding new
-capacity). the cost is not symmetric either: more layers costs roughly
-proportionally more train time (and more memory for activations, since
-each block needs its own set of matrices at every position), while more
-heads is almost free in time since `head_size = n_embd / n_head` shrinks
-to compensate, so we're doing the same total flops just split up
-differently.
+`n_layer` moved validation perplexity more than `n_head` did in our runs
+-- going from 1 to 5 layers gave a clearly bigger drop than 2 to 8 heads
+(which barely changed anything, more heads mostly just redistributes the
+same total attention compute instead of adding capacity). the cost isn't
+symmetric either: more layers costs roughly proportionally more train
+time and activation memory, more heads is close to free in time since
+`head_size = n_embd / n_head` shrinks to compensate.
 """)
 
 md("""\
 ### experiment 3: the final comparison
 
-count n-gram and neural n-gram, trained at the same k as the GPT
-(k=1000, main run), then all three plus the GPT next to each other.
+count n-gram (A2) and neural n-gram (A3), both `n=3`, trained at the same
+`k=1000` as the GPT main run, then all three side by side, on Shakespeare
+and on WSJ.
 """)
 
 code("""\
-count_ng = CountNgram(vocab_size=V, k=4)
-count_ng.train(train_ids)
+count_ng = NGramLM(n=N_ORDER, vocab_size=V_TOTAL)
+count_ng_seqs = pad_bos(train_seqs, CTX)
+t0 = time.time()
+count_ng.fit(count_ng_seqs)
+count_ng_time = time.time() - t0
+print("count n-gram fit in", count_ng_time, "sec")
 
-count_val_pp, count_val_ppc = perplexity(count_ng, val_ids[:EVAL_SLICE], chars_per_tok_train)
-count_test_pp, count_test_ppc = perplexity(count_ng, test_ids[:EVAL_SLICE], chars_per_tok_train)
-count_wsj_pp, count_wsj_ppc = perplexity(count_ng, wsj_ids[:EVAL_SLICE], chars_per_tok_train)
-count_params = V ** 3  # rough, every possible trigram context could in principle need its own row
+count_val_pp, count_val_ppc = perplexity(count_ng, flat_nn_val[:EVAL_SLICE], chars_per_tok, bos=BOS)
+count_test_pp, count_test_ppc = perplexity(count_ng, flat_nn_test[:EVAL_SLICE], chars_per_tok, bos=BOS)
+print("count n-gram: val ppc", count_val_ppc, "test ppc", count_test_ppc)
 
-print("count n-gram: val ppc", count_val_ppc, "test ppc", count_test_ppc, "wsj ppc", count_wsj_ppc)
+# rough parameter count: one float per (context, next token) pair actually seen
+count_params = sum(len(row) for row in count_ng.ngram_counts.values())
 """)
 
 code("""\
-ng_val_pp, ng_val_ppc = perplexity(neural_ng, val_ids[:EVAL_SLICE], chars_per_tok_train)
-ng_test_pp, ng_test_ppc = perplexity(neural_ng, test_ids[:EVAL_SLICE], chars_per_tok_train)
-ng_wsj_pp, ng_wsj_ppc = perplexity(neural_ng, wsj_ids[:EVAL_SLICE], chars_per_tok_train)
+ng_val_pp, ng_val_ppc = perplexity(neural_ng, flat_nn_val[:EVAL_SLICE], chars_per_tok, bos=BOS)
+ng_test_pp, ng_test_ppc = perplexity(neural_ng, flat_nn_test[:EVAL_SLICE], chars_per_tok, bos=BOS)
 ng_params = sum(p.numel() for p in neural_ng.parameters())
+print("neural n-gram: val ppc", ng_val_ppc, "test ppc", ng_test_ppc)
 
-gpt_test_pp, gpt_test_ppc = perplexity(model, test_ids[:EVAL_SLICE], chars_per_tok_train)
-gpt_wsj_pp, gpt_wsj_ppc = perplexity(model, wsj_ids[:EVAL_SLICE], chars_per_tok_train)
+gpt_test_pp, gpt_test_ppc = perplexity(model, flat_gpt_test.tolist()[:EVAL_SLICE], chars_per_tok, bos=BOS)
+print("GPT: val ppc", gpt_val_ppc, "test ppc", gpt_test_ppc)
+""")
 
-print("neural n-gram: val ppc", ng_val_ppc, "test ppc", ng_test_ppc, "wsj ppc", ng_wsj_ppc)
-print("GPT: val ppc", gpt_val_ppc, "test ppc", gpt_test_ppc, "wsj ppc", gpt_wsj_ppc)
+code("""\
+# now the WSJ side, same k=1000 tokenizer, same bos/eos convention
+wsj_seqs = [tok.encode(l) + [EOS] for l in wsj_lines]
+n_tok_wsj = sum(len(s) - 1 for s in wsj_seqs)
+n_chars_wsj = sum(len(l) for l in wsj_lines)
+cpt_wsj = n_chars_wsj / n_tok_wsj
+
+flat_wsj_ngram = flatten(pad_bos(wsj_seqs, CTX))
+flat_wsj_gpt = flatten(pad_bos(wsj_seqs, 1))
+
+count_wsj_pp, count_wsj_ppc = perplexity(count_ng, flat_wsj_ngram[:EVAL_SLICE], cpt_wsj, bos=BOS)
+ng_wsj_pp, ng_wsj_ppc = perplexity(neural_ng, flat_wsj_ngram[:EVAL_SLICE], cpt_wsj, bos=BOS)
+gpt_wsj_pp, gpt_wsj_ppc = perplexity(model, flat_wsj_gpt[:EVAL_SLICE], cpt_wsj, bos=BOS)
+
+print("count n-gram wsj ppc:", count_wsj_ppc)
+print("neural n-gram wsj ppc:", ng_wsj_ppc)
+print("GPT wsj ppc:", gpt_wsj_ppc)
 """)
 
 code("""\
 final_table = pd.DataFrame([
     dict(model="Count n-gram (A2)", shakespeare_ppc=count_test_ppc, wsj_ppc=count_wsj_ppc,
-         params=count_params, train_time_sec="~0 (counting)"),
+         params=count_params, train_time_sec=round(count_ng_time, 2)),
     dict(model="Neural n-gram (A3)", shakespeare_ppc=ng_test_ppc, wsj_ppc=ng_wsj_ppc,
          params=ng_params, train_time_sec=round(neural_ng_time, 1)),
     dict(model="GPT (A4)", shakespeare_ppc=gpt_test_ppc, wsj_ppc=gpt_wsj_ppc,
@@ -469,14 +522,14 @@ final_table
 """)
 
 md("""\
-biggest jump is from the count n-gram to the neural n-gram, moving from
+biggest jump is from the count n-gram to the neural n-gram -- moving from
 raw counts to a network that shares statistical strength across similar
 contexts through the embedding cuts the perplexity a lot by itself. going
 from the neural n-gram to the GPT is a smaller jump on shakespeare
-(diminishing returns, the block is small and shakespeare is a fairly
-repetitive corpus so context beyond 3-4 tokens is not worth *that* much),
+(diminishing returns, the block is small and shakespeare is fairly
+repetitive so context beyond a couple of tokens isn't worth *that* much),
 but the WSJ gap is bigger than the shakespeare gap for every model: WSJ
-is out of domain data, and the GPT's larger effective context and
+is out-of-domain data, and the GPT's larger effective context and
 capacity seems to let it fall back on more generic language structure
 when the specific shakespeare vocabulary doesn't apply, so it degrades
 less badly than the smaller models do.
@@ -519,26 +572,39 @@ print("gpt:          ", gpt_sample)
 
 md("""\
 count n-gram: mostly nonsense after the first couple of words, it only
-ever looks 3 tokens back so it has no idea what it "said" a sentence ago
-and just free-associates on local statistics. neural n-gram: a little
-better, the words at least look more like real shakespeare tokens because
-the embedding groups similar words together, but it still drifts and
-loses the thread quickly since it's stuck with the same tiny context
-window. gpt: clearly the most coherent of the three over a longer stretch,
-it keeps something like sentence structure going for longer because it
-can attend back to the whole block instead of just the last few tokens,
-though at this model size and this little training it still isn't
-actually making sense semantically.
+ever looks back 2 tokens (n=3) so it has no idea what it "said" a
+sentence ago and just free-associates on local statistics. neural
+n-gram: a little better, the words at least look more like real
+shakespeare tokens because the embedding groups similar words together,
+but it's stuck with the same tiny context window so it still drifts.
+gpt: clearly the most coherent of the three over a longer stretch, since
+it can attend back over the whole block instead of just the last two
+tokens, though at this model size and this little training it still
+isn't making real sense semantically.
 """)
 
 code("""\
-# does it ever emit <eos> on its own during generation? our tokenizer /
-# shakespeare corpus does not actually define an <eos> token (the corpus
-# is one long stream, assignment 1-3 never introduced one), so this is
-# structurally impossible here -- generation always runs to max_tokens.
-eos_in_vocab = "<eos>" in tok.vocab
-print("is <eos> even in the vocab:", eos_in_vocab)
-print("-> generation always stops at max_tokens, never on its own, because there is no <eos> token to predict")
+# does generation stop at <eos> on its own, and how often
+def eos_stop_rate(model, n=20):
+    stops = 0
+    for i in range(n):
+        ids = [bos_id(tok)] * getattr(model, "ctx_len", 1) + tok.encode(prompts[i % 3])
+        for _ in range(80):
+            logp = model.next_token_log_probs(ids)
+            p = np.exp(logp)
+            p = p / p.sum()
+            next_id = int(np.random.choice(len(p), p=p))
+            ids.append(next_id)
+            if next_id == eos_id(tok):
+                stops += 1
+                break
+    return stops / n
+
+
+np.random.seed(0)
+for name, m in [("count n-gram", count_ng), ("neural n-gram", neural_ng), ("gpt", model)]:
+    rate = eos_stop_rate(m)
+    print(f"{name}: stopped at <eos> on its own in {rate*100:.0f}% of {20} tries (rest hit the 80-token cap)")
 """)
 
 # ---------------------------------------------------------------------
