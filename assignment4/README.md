@@ -77,8 +77,10 @@ We did not run the GPU column (no GPU available on the machine we used).
 
 - Seed: `1337` (`torch.manual_seed`, also seeds `random` and `numpy`).
 - Machine: Linux container, CPU only, standard CPython, PyTorch CPU build.
-- Total notebook run time: _see the printed run time in the last cell of
-  the notebook and fill in here_.
+- Total notebook run time: about **24 minutes**, top to bottom (the
+  required 2000-step run alone is under 5 minutes, well inside the
+  10-minute budget; most of the rest is the 9 extra training runs from
+  the two experiment grids).
 
 ### Statement about AI use
 
