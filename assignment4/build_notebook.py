@@ -304,17 +304,24 @@ nn_history = nng.train(neural_ng, flat_nn_train, flat_nn_val, max_steps=2000, lr
                         batch_size=64, device=device, eval_every=500, eval_iters=30)
 neural_ng_time = time.time() - t0
 print("neural n-gram trained in", neural_ng_time, "sec")
-neural_ng_train_loss = nn_history["train_loss"][-1]
-print("neural n-gram final train loss:", neural_ng_train_loss)
+print("neural n-gram batched train loss (includes the easy bos->bos/eos transitions):", nn_history["train_loss"][-1])
 """)
 
 code("""\
 EVAL_SLICE = 3000  # scoring is one forward pass per token, cap it so this stays fast
 
+# the batched train loss above is not a fair number to compare against:
+# it averages over random windows that include predicting <bos> right
+# after <eos>, which is a free win and makes the neural n-gram look
+# better than it is. perplexity() skips <bos> targets, so we use THAT,
+# on the same train split, for an apples to apples comparison
+neural_ng_train_pp, _ = perplexity(neural_ng, flat_nn_train[:EVAL_SLICE], chars_per_tok, bos=BOS)
+neural_ng_train_loss = math.log(neural_ng_train_pp)
+
 gpt_val_pp, gpt_val_ppc = perplexity(model, flat_gpt_val.tolist()[:EVAL_SLICE], chars_per_tok, bos=BOS)
 gpt_val_loss = math.log(gpt_val_pp)
-print("GPT val loss (per token):", gpt_val_loss)
-print("neural n-gram train loss:", neural_ng_train_loss)
+print("GPT val loss (per token, bos excluded):", gpt_val_loss)
+print("neural n-gram train loss (per token, bos excluded):", neural_ng_train_loss)
 assert gpt_val_loss < neural_ng_train_loss, "gpt should beat the old neural ngram, something's off"
 print("check passed, GPT val loss beats neural n-gram train loss")
 """)
