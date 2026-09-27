@@ -1,13 +1,16 @@
 | Name | Student number | Tasks | Share |
 |---|---|---|---|
-| _TODO: fill in_ | _TODO_ | _TODO_ | _TODO %_ |
-| _TODO: fill in_ | _TODO_ | _TODO_ | _TODO %_ |
-| _TODO: fill in_ | _TODO_ | _TODO_ | _TODO %_ |
+| Baran | _TODO_ | Assignment 1 (BPE tokenizer) | 25 % |
+| Jeremy | _TODO_ | Assignment 2 (count n-gram) | 25 % |
+| Jonas | _TODO_ | Assignment 3 (neural n-gram) | 25 % |
+| Baran, Jeremy, Jonas | _TODO_ | Assignment 4 (this folder: GPT), together | 25 % |
 
-> The shares must sum to 100. All group members must agree to this table
-> before submission. **This table is a placeholder** — it must be filled in
-> by hand with real names, student numbers, tasks and shares before the ZIP
-> is handed in.
+> Unlike Assignments 1–3, this one really was a three-way effort: all three
+> of us worked on the GPT model, the integration with Assignments 2 and 3,
+> and the experiments below. Shares are stated across the four assignments
+> as a whole; see the root [`README.md`](../README.md) for the full
+> breakdown. Student numbers are still placeholders — fill them in by hand
+> before the ZIP is handed in.
 
 One sentence about each member's work, in their own words: _TODO — replace
 this line for each member._
@@ -24,17 +27,31 @@ generalization check on Wall Street Journal text.
 
 - `gpt.py` — `Head`, `MultiHeadAttention`, `FeedForward`, `Block`, `GPT`,
   `get_batch`, `estimate_loss`, `train`. New code for this assignment.
-- `ngram.py` — `NGramLM`, the count-based n-gram engine from Assignment 2
-  (`fit(sequences)`, add-one smoothing `P(w|h) = (c(h,w)+1)/(c(h)+V)`, no
-  special-casing of zero counts since the formula already does the right
-  thing), reused unchanged.
-- `neural_ngram.py` — `NeuralNGramLM` from Assignment 3 (embed the n-1
-  context tokens, concat, one hidden layer, softmax over V), plus its
-  `train` function, reused unchanged.
-- `evaluation.py` — `perplexity` and `generate`, unchanged since
-  Assignment 2 per rule 3 of the sheet. Also where the `<bos>`/`<eos>`
-  convention shared by every model lives: they aren't part of the BPE
-  vocabulary itself, so `bos_id(tok) = tok.vocab_size()` and
+- `ngram.py` — `NGramLM`, Jeremy's real count-based n-gram engine from
+  Assignment 2 (`fit(sequences)`, add-one smoothing
+  `P(w|h) = (c(h,w)+1)/(c(h)+V)`, no special-casing of zero counts since the
+  formula already does the right thing), copied over verbatim.
+- `neural_ngram.py` — `NeuralNGramLM`, Jonas's real model from Assignment 3
+  (embed the n-1 context tokens, concat, one hidden layer, softmax over V),
+  copied over verbatim. `get_batch`/`estimate_loss`/`train` below it are
+  this assignment's own training utilities (Assignment 3 kept that part
+  inline in its notebook rather than in a module) — they train the real
+  class above without changing anything inside it.
+- `evaluation.py` — `perplexity` and `generate`, this assignment's own
+  evaluation harness: it walks the *full* growing context over a long
+  token stream and lets each model crop it to whatever it needs, which is
+  what lets one pair of functions score the count n-gram, the neural
+  n-gram and the GPT alike. This is deliberately **not** Assignment 2's
+  `perplexity`/`generate` (those window context to exactly `n-1` tokens by
+  convention, correct for an n-gram but it would cut the GPT off after a
+  single token of context and defeat the entire comparison). What changed
+  here is `context_length`/`crop_context`: two small helpers so this
+  harness calls the real `NGramLM` from Assignment 2 exactly the way its
+  own notebook does (a `(n-1)`-token window handed in from outside, since
+  `NGramLM` doesn't crop it itself) while leaving the neural n-gram and the
+  GPT untouched (they already crop internally). Also where the `<bos>`/
+  `<eos>` convention shared by every model lives: they aren't part of the
+  BPE vocabulary itself, so `bos_id(tok) = tok.vocab_size()` and
   `eos_id(tok) = tok.vocab_size() + 1`, and every model is constructed
   with `vocab_size = tok.vocab_size() + 2`.
 - `bpe.py` — the Assignment 1 tokenizer (`BPETokenizer`, `normalize`),
@@ -92,8 +109,8 @@ We did not run the GPU column (no GPU available on the machine we used).
 
 - Seed: `1337` (`torch.manual_seed`, also seeds `random` and `numpy`).
 - Machine: Linux container, CPU only, standard CPython, PyTorch CPU build.
-- Total notebook run time: about **21 minutes**, top to bottom (the
-  required 2000-step run alone is under 4 minutes, well inside the
+- Total notebook run time: about **12 minutes**, top to bottom (the
+  required 2000-step run alone is under 2.5 minutes, well inside the
   10-minute budget; the rest is the k-sweep, the hyperparameter grid, and
   the neural n-gram baseline).
 
@@ -101,9 +118,9 @@ We did not run the GPU column (no GPU available on the machine we used).
 
 | Model | Shakespeare PP/char | WSJ PP/char | Params | Train time |
 |---|---|---|---|---|
-| Count n-gram (A2) | 9.63 | 13.55 | 178,726 counted (context, token) pairs | 0.6 s |
-| Neural n-gram (A3) | 5.91 | 9.39 | 375,531 | 67 s |
-| GPT (A4) | 4.84 | 9.00 | 876,331 | 231 s |
+| Count n-gram (A2) | 9.63 | 13.55 | 235,079 counted n-grams + contexts | 0.3 s |
+| Neural n-gram (A3) | 5.91 | 9.39 | 375,531 | 44.5 s |
+| GPT (A4) | 4.84 | 9.00 | 876,331 | 142.0 s |
 
 All three checks in the notebook pass: pre-training loss sits at 7.12 vs.
 `ln(V_total) = 6.97`, the causal-mask sanity check shows a 0.0 difference
@@ -115,17 +132,38 @@ time (100 % for the neural n-gram and the GPT in our 20-try check, 10 %
 for the count n-gram, which loses the thread too quickly to ever reach a
 sentence end).
 
+These numbers are Jeremy's real `NGramLM` and Jonas's real `NeuralNGramLM`
+running inside this notebook now (see "Statement about AI use" below), not
+re-implementations of them — and they come out effectively identical to
+the ones this README reported before that swap (same formulas, same
+architecture, same seed), which is exactly what should happen. The one
+number that did move is the count n-gram's parameter count: it's now
+counted the way Assignments 2 and 3 themselves count it (distinct n-grams
+plus distinct contexts stored), rather than the old ad-hoc count.
+
 ### Statement about AI use
 
 An AI assistant (Claude) helped write the GPT implementation
 (`gpt.py`: the attention head, multi-head attention, feedforward block,
 and the full model) from the written specification in the assignment
-sheet, wrote `ngram.py` and `neural_ngram.py` to match the exact required
-interfaces from Assignments 2 and 3 (`NGramLM.fit`, `NeuralNGramLM`, the
-`<bos>`/`<eos>`/`<unk>` vocabulary convention) so that Assignment 4 could
-be run standalone against faithful stand-ins for the earlier assignments,
-drafted the notebook structure and the experiment/plotting code, and set
-up the Wall Street Journal file exactly as Assignment 3 specifies
+sheet, drafted the notebook structure and the experiment/plotting code,
+and set up the Wall Street Journal file exactly as Assignment 3 specifies
 (same URL, same md5/line-count check, same `<unk>` → `unknown` cleanup).
+
+`ngram.py` and `neural_ngram.py` originally held from-scratch
+re-implementations of `NGramLM` and `NeuralNGramLM`, written to match
+Assignments 2 and 3's required interfaces as faithful stand-ins, because
+Assignments 2 and 3 didn't exist as real code yet at the time. Now that
+they do, an AI assistant (Claude) replaced those stand-ins with Jeremy's
+and Jonas's actual classes, copied over verbatim, and adjusted only
+`evaluation.py`'s two small `context_length`/`crop_context` helpers (plus
+the one cell that counted the count n-gram's stored entries, and one that
+primed generation with the right number of `<bos>` tokens) so this
+notebook calls the real `NGramLM` the same way its own Assignment 2
+notebook does. Nothing inside `NGramLM.fit`/`log_prob`, or inside
+`NeuralNGramLM.forward`/`log_prob`, was changed; `gpt.py` was not touched
+either. The notebook was re-executed end to end (**Restart and Run All**)
+after the swap; the numbers above are from that run.
+
 Every group member is expected to be able to walk through `gpt.py` line
 by line in the review session, per rule 5 of the assignment.
