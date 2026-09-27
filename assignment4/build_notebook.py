@@ -47,7 +47,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from bpe import BPETokenizer
-from evaluation import perplexity, generate, bos_id, eos_id, total_vocab_size
+from evaluation import perplexity, generate, bos_id, eos_id, total_vocab_size, context_length, crop_context
 from ngram import NGramLM
 from neural_ngram import NeuralNGramLM
 import neural_ngram as nng
@@ -483,8 +483,9 @@ count_val_pp, count_val_ppc = perplexity(count_ng, flat_nn_val[:EVAL_SLICE], cha
 count_test_pp, count_test_ppc = perplexity(count_ng, flat_nn_test[:EVAL_SLICE], chars_per_tok, bos=BOS)
 print("count n-gram: val ppc", count_val_ppc, "test ppc", count_test_ppc)
 
-# rough parameter count: one float per (context, next token) pair actually seen
-count_params = sum(len(row) for row in count_ng.ngram_counts.values())
+# rough parameter count: one count per (context, next token) pair actually
+# seen, plus one per context -- matches how assignment 2/3 count it
+count_params = len(count_ng.ngram_counts) + len(count_ng.context_counts)
 """)
 
 code("""\
@@ -595,9 +596,9 @@ code("""\
 def eos_stop_rate(model, n=20):
     stops = 0
     for i in range(n):
-        ids = [bos_id(tok)] * getattr(model, "ctx_len", 1) + tok.encode(prompts[i % 3])
+        ids = [bos_id(tok)] * context_length(model) + tok.encode(prompts[i % 3])
         for _ in range(80):
-            logp = model.next_token_log_probs(ids)
+            logp = model.next_token_log_probs(crop_context(model, ids))
             p = np.exp(logp)
             p = p / p.sum()
             next_id = int(np.random.choice(len(p), p=p))
