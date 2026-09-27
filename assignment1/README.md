@@ -1,13 +1,16 @@
 | Name | Student number | Tasks | Share |
 |---|---|---|---|
-| _TODO: fill in_ | _TODO_ | _TODO_ | _TODO %_ |
-| _TODO: fill in_ | _TODO_ | _TODO_ | _TODO %_ |
-| _TODO: fill in_ | _TODO_ | _TODO_ | _TODO %_ |
+| Baran | _TODO_ | Assignment 1 (this folder: BPE tokenizer) | 25 % |
+| Jeremy | _TODO_ | Assignment 2 (count n-gram) | 25 % |
+| Jonas | _TODO_ | Assignment 3 (neural n-gram) | 25 % |
+| Baran, Jeremy, Jonas | _TODO_ | Assignment 4 (GPT), together | 25 % |
 
-> The shares must sum to 100. All group members must agree to this table
-> before submission. **This table is a placeholder** — it must be filled in
-> by hand with real names, student numbers, tasks and shares before the ZIP
-> is handed in.
+> Shares are across the four assignments as a whole, not within this single
+> folder: Baran owns Assignment 1 end to end, the same way Jeremy owns
+> Assignment 2 and Jonas owns Assignment 3, and all three worked together on
+> Assignment 4. See the root [`README.md`](../README.md) for the full
+> breakdown. Student numbers are still placeholders — fill them in by hand
+> before the ZIP is handed in.
 
 One sentence about each member's work, in their own words: _TODO — replace
 this line for each member._

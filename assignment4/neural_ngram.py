@@ -1,7 +1,10 @@
 """
-the neural n-gram from assignment 3, a small bengio-style MLP: embed the
-n-1 context tokens, concat, one hidden layer, softmax over V. carried
-over unchanged per rule 3 of assignment 4.
+the neural n-gram from assignment 3: Jonas's real NeuralNGramLM class,
+copied here verbatim (not a stand-in anymore). get_batch/estimate_loss/
+train below are assignment 4's own training utilities, written because
+assignment 3 kept that part inline in its notebook rather than in a
+module -- they orchestrate the real class above without changing anything
+inside it.
 """
 
 import torch
@@ -10,39 +13,82 @@ import torch.nn.functional as F
 
 
 class NeuralNGramLM(nn.Module):
+
     def __init__(self, n, vocab_size, n_embd=64, n_hidden=256):
         super().__init__()
+
         self.n = n
         self.ctx_len = n - 1
-        self.V = vocab_size
-        self.tok_emb = nn.Embedding(vocab_size, n_embd)
-        self.fc1 = nn.Linear(n_embd * self.ctx_len, n_hidden)
-        self.fc2 = nn.Linear(n_hidden, vocab_size)
+        self.vocab_size = vocab_size
+
+        # converting every token id into an embedding vector
+        self.embedding = nn.Embedding(vocab_size, n_embd)
+
+        # taking all context embeddings as one vector
+        self.hidden = nn.Linear(self.ctx_len * n_embd, n_hidden)
+
+        self.relu = nn.ReLU()
+
+        # giving one output score for every token in vocabulary
+        self.output = nn.Linear(n_hidden, vocab_size)
+
 
     def forward(self, idx, targets=None):
-        emb = self.tok_emb(idx)          # B, ctx_len, n_embd
-        flat = emb.view(emb.shape[0], -1)
-        h = F.relu(self.fc1(flat))
-        logits = self.fc2(h)
+
+        # convert token ids into embeddings
+        embeddings = self.embedding(idx)
+
+        # put embeddings of the context into one vector
+        flat = embeddings.view(embeddings.shape[0], -1)
+
+        # hidden layer and ReLU
+        hidden = self.relu(self.hidden(flat))
+
+        # scores for every possible next token
+        logits = self.output(hidden)
+
+        # calculate loss only if targets are given
         loss = None
+
         if targets is not None:
             loss = F.cross_entropy(logits, targets)
+
         return logits, loss
+
 
     @torch.no_grad()
     def next_token_log_probs(self, context):
-        device = next(self.parameters()).device
-        ctx = list(context[-self.ctx_len:])
-        if len(ctx) < self.ctx_len:
-            # pad on the left, happens mostly right after a <bos>
-            ctx = [ctx[0] if ctx else 0] * (self.ctx_len - len(ctx)) + ctx
-        x = torch.tensor([ctx], dtype=torch.long, device=device)
-        logits, _ = self.forward(x)
-        logp = F.log_softmax(logits[0], dim=-1)
-        return logp.cpu().numpy()
 
+        self.eval()
+
+        # only use the previous n-1 tokens
+        context = context[-self.ctx_len:]
+
+        # convert context into tensor
+        x = torch.tensor(
+            [context],
+            dtype=torch.long,
+            device=next(self.parameters()).device
+        )
+
+        # get output scores
+        logits, _ = self.forward(x)
+
+        # convert scores into probabilities and then log probabilities
+        probabilities = F.softmax(logits[0], dim=-1)
+        log_probs = torch.log(probabilities)
+
+        return log_probs.cpu().numpy()
+
+
+    @torch.no_grad()
     def log_prob(self, token, context):
-        return float(self.next_token_log_probs(context)[token])
+
+        # get probabilities for all possible next tokens
+        log_probs = self.next_token_log_probs(context)
+
+        # return probability of the wanted token
+        return float(log_probs[token])
 
 
 def get_batch(ids, ctx_len, batch_size, device):
